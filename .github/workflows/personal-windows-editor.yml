@@ -1,0 +1,97 @@
+name: Personal Windows Editor
+on:
+  workflow_dispatch:
+  push:
+    branches: [master]
+    paths: [.github/workflows/personal-windows-editor.yml]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: personal-windows-editor
+  cancel-in-progress: false
+
+jobs:
+  windows-editor:
+    runs-on: windows-latest
+    timeout-minutes: 180
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Set up Python and SCons
+        uses: ./.github/actions/godot-deps
+        with:
+          python-version: '3.12'
+
+      - name: Install Direct3D 12 dependencies
+        run: python misc/scripts/install_d3d12_sdk_windows.py
+
+      - name: Install ANGLE dependencies
+        run: python misc/scripts/install_angle.py
+
+      - name: Install AccessKit dependencies
+        run: python misc/scripts/install_accesskit.py
+
+      - name: Compile Windows x64 editor
+        shell: pwsh
+        run: |
+          $jobs = [Math]::Max(1, [Environment]::ProcessorCount - 1)
+          python -m SCons platform=windows target=editor arch=x86_64 dev_build=no debug_symbols=no lto=none "-j$jobs"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Check version and headless startup
+        shell: pwsh
+        run: |
+          $exe = Join-Path $PWD 'bin/godot.windows.editor.x86_64.exe'
+          & $exe --headless --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          New-Item -ItemType Directory -Force smoke | Out-Null
+          @'
+          config_version=5
+          [application]
+          config/name="Build smoke test"
+          [rendering]
+          renderer/rendering_method="gl_compatibility"
+          '@ | Set-Content smoke/project.godot -Encoding utf8
+          & $exe --headless --editor --path smoke --quit
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Package editor and license
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force package | Out-Null
+          $bin = (Resolve-Path bin).Path
+          Get-ChildItem bin -Recurse -File | Where-Object {
+            $_.Extension -in '.exe', '.dll' -and
+            $_.FullName -notmatch '[\\/](obj|build_deps)[\\/]'
+          } | ForEach-Object {
+            $relative = [IO.Path]::GetRelativePath($bin, $_.FullName)
+            $destination = Join-Path package $relative
+            New-Item -ItemType Directory -Force (Split-Path $destination) | Out-Null
+            Copy-Item $_.FullName $destination
+          }
+          Copy-Item LICENSE.txt package
+          Copy-Item COPYRIGHT.txt package
+          @(
+            "Source: https://github.com/frainkey1/Godot"
+            "Commit: ${{ github.sha }}"
+            "Target: Windows x64 Godot editor; standard non-.NET build"
+            "Launch: godot.windows.editor.x86_64.exe"
+            "This is a personal source build, not an official Godot release."
+          ) | Set-Content package/BUILD-INFO.txt -Encoding utf8
+          Get-ChildItem package -Recurse -File | ForEach-Object {
+            $hash = Get-FileHash $_.FullName -Algorithm SHA256
+            "$($hash.Hash)  $([IO.Path]::GetRelativePath((Resolve-Path package).Path, $_.FullName))"
+          } | Set-Content package/SHA256SUMS.txt -Encoding ascii
+
+      - name: Upload standalone editor
+        uses: actions/upload-artifact@v4
+        with:
+          name: Godot-Windows-x64-Editor
+          path: package/
+          if-no-files-found: error
+          retention-days: 7
